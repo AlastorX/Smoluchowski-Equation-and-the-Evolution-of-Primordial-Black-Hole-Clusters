@@ -209,7 +209,7 @@ def select_molecules(masses, cumulative_K_i, unique_masses, interaction_map, ind
 # Main simulation
 def run_simulation(ntot, density, time_max, nevery_hist, myseed,time_threshold):
     np.random.seed(myseed)
-    path = "/home/storage0/users/zhangborui/storage2/PBH_file/Smoluchowski_simulation_2025_6_18_CPU_time/2025613optimized_simulation_ntot%d_density%.2e" % (ntot, density)
+    path = "xx/optimized_simulation_ntot%d_density%.2e" % (ntot, density)
     mkdir(path)
 
     # Initialize masses array (all monomers initially)
