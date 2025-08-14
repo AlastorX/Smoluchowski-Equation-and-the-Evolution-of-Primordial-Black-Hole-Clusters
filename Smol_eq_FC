@@ -1,0 +1,378 @@
+# in this file, we try to solve the Smoluchowski equation through MC simulation and  the merger events at time slices
+#!/home/yourname/miniconda3/envs/myenv/bin/python
+import numpy as np
+import os
+import time
+import json
+from numba import njit, prange
+import argparse
+from multiprocessing import Pool
+#from concurrent.futures import ThreadPoolExecutor
+# Timer to measure total execution time
+start_time = time.time()
+
+@njit
+def k_rate(mi, mj):
+    return (mi + mj)**(9/14) * (mi * mj)**(15/14)
+
+def mkdir(path):
+    if not os.path.exists(path):
+        os.makedirs(path)
+        print('Directory created:', path)
+    else:
+        print('Directory already exists:', path)
+
+def get_unique_masses_and_counts(masses):
+    unique_masses, counts = np.unique(masses[masses != 0], return_counts=True)
+    return unique_masses, counts
+
+@njit# mass array to unique mass mapping len(masses)=N, len(unique_masses)<<N
+def get_index_to_unique_idx(masses, unique_masses):
+    index_to_unique_idx = np.zeros(len(masses), dtype=np.int32)  # Explicitly set dtype to int32
+    for i, mass in enumerate(masses):
+        if mass != 0:
+            index_to_unique_idx[i] = np.where(unique_masses == mass)[0][0]
+    return index_to_unique_idx
+
+@njit#(parallel=True)# calculate the merger rate of masses in unique_mass array n_u\time n_u which is much smaller than N\times N, here we use a dictionary
+def initialize_interaction_map(unique_masses):
+    interaction_map = {}
+    for i, mi in enumerate(unique_masses):
+        for j, mj in enumerate(unique_masses[:i+1]):  # Calculate only once using symmetry
+            interaction_map[(mi, mj)] = k_rate(mi, mj)
+            interaction_map[(mj, mi)] = interaction_map[(mi, mj)]  # Use symmetry
+    return interaction_map
+
+@njit
+#initial K_i
+def get_K_i(interaction_map, masses, index_to_unique_idx, unique_masses):
+    """Efficiently compute initial K_i using unique mass counts and interactions."""
+    ntot = len(masses)
+    K_i = np.zeros(ntot-1)
+    kij=k_rate(masses[0], masses[0])#since intially the mass distribution is monochromatic
+    for i in range(ntot-1):
+        K_i[i] = kij*(ntot-i)
+
+    return K_i
+# Update interaction map after a new mass is formed
+def update_unique_masses_and_counts(masses, unique_masses, mass_counts, index_to_unique_idx, i, j, mstorei, mstorej):
+    """Updates unique_masses and counts based on the result of merging masses[i] into masses[j]."""
+
+    # Masses after merger
+    m_ia = masses[i]
+    m_ja = masses[j]
+
+    # Masses before merger
+    m_ib = mstorei
+    m_jb = mstorej
+
+    def remove_mass_and_adjust_indices(mass, unique_masses, mass_counts, index_to_unique_idx):
+        """Helper to remove a mass from unique_masses, adjust counts, and update index_to_unique_idx."""
+        if mass in unique_masses:
+            mass_idx = np.where(unique_masses == mass)[0][0]
+            if mass_counts[mass_idx] > 1:
+                mass_counts[mass_idx] -= 1
+            else:
+                # Remove mass and adjust the index mapping
+                unique_masses = np.delete(unique_masses, mass_idx)
+                mass_counts = np.delete(mass_counts, mass_idx)
+                # Adjust index_to_unique_idx for indices greater than the removed one
+                index_to_unique_idx = np.where(
+                    index_to_unique_idx > mass_idx,
+                    index_to_unique_idx - 1,
+                    index_to_unique_idx
+                )
+        return unique_masses, mass_counts, index_to_unique_idx
+
+    # Remove old masses (m_ib and m_jb) and adjust indices
+    unique_masses, mass_counts, index_to_unique_idx = remove_mass_and_adjust_indices(
+        m_ib, unique_masses, mass_counts, index_to_unique_idx
+    )
+    unique_masses, mass_counts, index_to_unique_idx = remove_mass_and_adjust_indices(
+        m_jb, unique_masses, mass_counts, index_to_unique_idx
+    )
+
+    # Update unique_masses and mass_counts for the new m_ja
+    if m_ja in unique_masses:
+        j_idxa = np.where(unique_masses == m_ja)[0][0]
+        mass_counts[j_idxa] += 1
+        index_to_unique_idx[j] = j_idxa
+    else:
+        # Add new unique mass
+        unique_masses = np.append(unique_masses, m_ja)
+        mass_counts = np.append(mass_counts, 1)
+        j_idxa = len(unique_masses) - 1  # New index
+        index_to_unique_idx[j] = j_idxa
+
+    # Mark the original i index in index_to_unique_idx as zero
+    index_to_unique_idx[i] = 0
+
+    return unique_masses, mass_counts, index_to_unique_idx
+
+@njit
+def update_interaction_map(interaction_map, new_mass, unique_masses):
+    """Update the interaction map for the new merged mass."""
+    for mi in unique_masses:
+        interaction_map[(mi, new_mass)] = k_rate(mi, new_mass)
+        interaction_map[(new_mass, mi)] = interaction_map[(mi, new_mass)]  # Use symmetry
+
+
+@njit
+def update_K_i(K_i, interaction_map, masses, index_to_unique_idx, unique_masses, i, j, mstorei,mstorej):
+    """update Ki after the merger of i and j, and only update Ki related to this pair """
+
+    non_zero_indices = np.nonzero(masses)[0]  # obtain all the indices of ono-zero components
+    n_mol = len(non_zero_indices)
+    
+    # Case 1: update all  K_i[k] with k < i < j 
+    for k in range(i):
+        if masses[k] == 0:
+            continue
+        mk_idx = index_to_unique_idx[k]
+        mi_idx = index_to_unique_idx[i]
+        mj_idx = index_to_unique_idx[j]
+        
+        # sbstract the original term of K_rate[m[i],m[k]] and K_rate[m[j],m[k]] and add new K_rate[m[j],m[k]]
+        mi, mj, mk = unique_masses[mi_idx], unique_masses[mj_idx], unique_masses[mk_idx]
+        K_i[k] -= interaction_map[(mk, mstorei)] + interaction_map[(mk, mstorej)]
+        K_i[k] += interaction_map[(mk, mj)]  # m[j] after the updating 
+    
+    # Case 2: only update the term related to j with k in the range i < k < j 
+    for k in range(i + 1, j):
+        if masses[k] == 0:
+            continue
+        mk_idx = index_to_unique_idx[k]
+        mj_idx = index_to_unique_idx[j]
+        
+        
+        mk, mj = unique_masses[mk_idx], unique_masses[mj_idx]
+        K_i[k] -= interaction_map[(mk, mstorej)]
+        K_i[k] += interaction_map[(mk, mj)]  # here m[j] is the one after updating 
+    
+    # Case 3: calculating K_i[i] and K_i[j]
+    K_i[i] = 0  # m[i]=0, K_i[i] must be zero
+    
+    # recalculate K_i[j]
+    if j < len(masses)-1:
+        K_i[j] = 0
+        for k in range(j + 1, len(masses)):
+            if masses[k] == 0:
+                continue
+            mk_idx = index_to_unique_idx[k]
+            mk, mj = unique_masses[mk_idx], unique_masses[mj_idx]
+            K_i[j] += interaction_map[(mj, mk)]  # m[j] has been updated
+    return K_i
+# Select i and j based on cumulative sums, following the full-conditioning method
+
+
+
+@njit
+def select_molecules(masses, cumulative_K_i, unique_masses, interaction_map, index_to_unique_idx,non_zero_indices,n_mol):
+    """First select i based on K_i and then j conditionally based on i."""
+    # Select index i from mass array
+    select_indice_i =non_zero_indices[:len(non_zero_indices)-1]
+    total_sum_i = cumulative_K_i[-1]
+    r = np.random.rand() * total_sum_i
+    i_idx = np.searchsorted(cumulative_K_i[select_indice_i], r)
+    i=select_indice_i[i_idx]
+    #if i_idx >= len(masses) or masses[i_idx] == 0:
+    #    return None, None  # Invalid selection
+
+    # Now select j conditionally on i
+   # mi = masses[i]
+    mi_unique_idx = index_to_unique_idx[i]
+
+    # Calculate cumulative sum for selecting j conditioned on i
+    cumulative_K_ij = []
+    cumulative_sum = 0
+    for j_idx in range(i_idx + 1, n_mol):
+        #if masses[j_idx] == 0:
+        #    continue  # Skip already coagulated masses
+        j= non_zero_indices[j_idx]
+        #mj = masses[j_idx]
+        mj_unique_idx = index_to_unique_idx[j]
+        cumulative_sum += interaction_map[(unique_masses[mi_unique_idx], unique_masses[mj_unique_idx])]
+        cumulative_K_ij.append(cumulative_sum)
+
+    cumulative_K_ij = np.array(cumulative_K_ij)
+    if len(cumulative_K_ij) == 0:
+        return None, None  # No valid j found
+
+    # Select j from cumulative sum
+    r2 = np.random.rand() * cumulative_sum
+    j_relative_idx = np.searchsorted(cumulative_K_ij, r2)
+    j = non_zero_indices[i_idx + 1 + j_relative_idx]
+
+    return i, j
+
+
+# Main simulation
+def run_simulation(ntot, density, time_max, nevery_hist, myseed,time_threshold):
+    np.random.seed(myseed)
+    path = "/home/storage0/users/zhangborui/storage2/PBH_file/Smoluchowski_simulation_2025_6_18_CPU_time/2025613optimized_simulation_ntot%d_density%.2e" % (ntot, density)
+    mkdir(path)
+
+    # Initialize masses array (all monomers initially)
+    masses = np.ones(ntot, dtype=int)
+    # Initial unique masses and counts
+    unique_masses, mass_counts = get_unique_masses_and_counts(masses)
+    index_to_unique_idx = get_index_to_unique_idx(masses, unique_masses)
+
+    # Initialize interaction map using symmetry
+    interaction_map = initialize_interaction_map(unique_masses)
+
+    # Initial cumulative K_i
+    K_i = get_K_i(interaction_map, masses, index_to_unique_idx, unique_masses)
+    cumulative_K_i = np.cumsum(K_i)
+
+    # Simulation loop
+    with open(f"{path}/mav_vs_t_ntot{ntot}_density{density:.2e}_tmax{time_max:.2e}.txt", "w") as fout:
+        waiting_time = float(0.0) # make it more precise
+        step = 0
+        hist_count = 0
+        non_zero_indices = np.nonzero(masses)[0]
+        n_mol = len(non_zero_indices)
+        history = {}  # Dictionary to store counts of (time_bin, mass[i], mass[j])
+        time_threshold=time_threshold# the threshold to store the information
+        while waiting_time < time_max and np.count_nonzero(masses) > 1:
+            step += 1
+
+            # Select pair (i, j)
+            i, j = select_molecules(masses, cumulative_K_i, unique_masses, interaction_map, index_to_unique_idx,non_zero_indices,n_mol)
+            if i is None or j is None:
+                step -= 1
+                break # Invalid selection, retry
+            
+            # Increment waiting time
+            total_sum = cumulative_K_i[-1]
+            r3 = np.random.rand()
+            waiting_time += ntot / (total_sum * density) * np.log(1 / r3)
+            mstorei=masses[i]
+            mstorej=masses[j]
+            
+            ###################################################################################################################
+            #store the merger information in history
+            # Determine the time bin
+            time_bin = step//time_threshold
+            if time_bin not in history:
+                history[time_bin] = {}
+        
+            pair_key = tuple(sorted((mstorei, mstorej)))  # Ensure consistent ordering
+        
+            if pair_key not in history[time_bin]:
+                history[time_bin][pair_key] = 0
+        
+            history[time_bin][pair_key] += 1  # Increment count for this pair within the time bin
+            ###################################################################################################################
+            # Coagulate i and j
+            new_mass = masses[j] + masses[i]
+            masses[j] = new_mass
+            masses[i] = 0  # Mark i as coagulated
+            #update non-zero indices
+            non_zero_indices = np.nonzero(masses)[0]
+            n_mol = len(non_zero_indices)
+             #Update unique masses and interaction map
+            #unique_masses, mass_counts = get_unique_masses_and_counts(masses)
+            #index_to_unique_idx = get_index_to_unique_idx(masses, unique_masses)
+            unique_masses, mass_counts, index_to_unique_idx = update_unique_masses_and_counts(masses,unique_masses, mass_counts, index_to_unique_idx, i, j,mstorei,mstorej)
+            update_interaction_map(interaction_map, new_mass, unique_masses)
+            # Update only relevant cumulative K_i from i onward
+            K_i = update_K_i(K_i, interaction_map, masses, index_to_unique_idx, unique_masses, i, j, mstorei,mstorej)
+            #K_i[i:]=get_K_i(interaction_map, masses, index_to_unique_idx, unique_masses)[i:]
+            cumulative_K_i = np.cumsum(K_i)
+            #print(total_sum)
+            #print(len(K_i))
+           # print(masses)
+           # print( np.count_nonzero(masses))
+            # Compute mean mass and reaction extent
+            mean_mass = np.mean(masses[masses != 0])
+            reac_extent = 1 - np.count_nonzero(masses) / ntot
+            fout.write(f"{waiting_time:.4e} {mean_mass:.4e} {reac_extent:.4e}\n")
+            
+            # Save histogram every nevery_hist steps
+            if step % nevery_hist == 0:
+               # masses_values, masses_occurrences = np.unique(masses[masses != 0], return_counts=True)
+               # hist = np.column_stack((masses_values, masses_occurrences))
+                #sort_indices = np.argsort(unique_masses)
+                #masses_values = unique_masses[sort_indices]
+                #masses_occurrences = mass_counts[sort_indices]#however, this make the program slower
+                hist = np.column_stack((unique_masses,mass_counts))
+                np.savetxt(f"{path}/hist_n{step:010d}_waiting_t{waiting_time:.6e}.txt", hist, fmt="%d %d")
+                hist_count += 1
+                '''
+            # Save time_according to time_threshold
+            if step % nevery_hist == 0:
+               # masses_values, masses_occurrences = np.unique(masses[masses != 0], return_counts=True)
+               # hist = np.column_stack((masses_values, masses_occurrences))
+                #sort_indices = np.argsort(unique_masses)
+                #masses_values = unique_masses[sort_indices]
+                #masses_occurrences = mass_counts[sort_indices]#however, this make the program slower
+                hist = np.column_stack((unique_masses,mass_counts))
+                np.savetxt(f"{path}/hist_n{step:010d}_waiting_t{waiting_time:.6e}.txt", hist, fmt="%d %d")
+                hist_count += 1                
+                '''
+
+                
+            # Convert dictionary keys to strings for JSON serialization
+        serializable_history = {
+            str(time_bin): {str(k): v for k, v in mass_data.items()} 
+            for time_bin, mass_data in history.items()
+    }
+    
+        with open(f"{path}_ntot{ntot}_history.txt", "w") as f:
+            json.dump(serializable_history, f, indent=4)
+              
+            
+        print("waiting_time =", waiting_time)
+# Run the simulation with default parameters, we must make sure that time_threshold>=nevery_hist
+def run_simulation_multi(N):
+     run_simulation(ntot=N, density=1.0, time_max=1e5, nevery_hist=10, myseed=123,time_threshold=10)
+
+# Wrap the original function and add timing
+def run_with_timing(n):
+    t0 = time.time()
+    run_simulation_multi(n)
+    elapsed = time.time() - t0
+    # Return a tuple: (parameter, calculation result, computation time)
+    return n,elapsed
+
+def main():
+    parser = argparse.ArgumentParser(description="Multiprocessing parameter scan program")
+    parser.add_argument("--N_list", type=int, nargs="+", required=True,
+                        help=""Multi-process parameter scanning program, for example：1000 10000 20000")
+    parser.add_argument("--processes", type=int, default=None,
+                        help="Number of processes (uses all CPU cores by default)")
+    args = parser.parse_args()
+
+    # Record the global start time (optional)
+    overall_t0 = time.time()
+
+    # Call run_with_timing in parallel instead of the original run_simulation_multi
+    with Pool(processes=args.processes) as pool:
+        try:
+            results = []
+            total = len(args.N_list)
+            for i, (n, elapsed) in enumerate(
+                    pool.imap_unordered(run_with_timing, args.N_list), start=1):
+                results.append((n, elapsed))
+                print(f"process: {i}/{total}  parameter n={n} timing {elapsed:.3f}s", end='\r')
+            # Sort in the original order
+            results.sort(key=lambda x: args.N_list.index(x[0]))
+        except KeyboardInterrupt:
+            print("\n User interrupted, saving partial results…")
+        except Exception as e:
+            print(f"\n: An unexpected error occurred: {e}")
+
+    overall_elapsed = time.time() - overall_t0
+
+    # write in the result file
+    with open("timingoutput.txt", "w") as f:
+        f.write(f"# Parameter scan results (a total of {len(results)} items), total elapsed time {overall_elapsed:.3f}s\n")
+        f.write("n\tresult\telapsed[s]\n")
+        for n,elapsed in results:
+            f.write(f"{n}\t{elapsed:.6f}\n")
+
+    print(f"\n  Computation complete！Total elapsed time {overall_elapsed:.2f}s，see output.txt")
+
+if __name__ == "__main__":
+    main()
