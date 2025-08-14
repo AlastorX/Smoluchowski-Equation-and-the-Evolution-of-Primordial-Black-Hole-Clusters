@@ -1,0 +1,166 @@
+import numpy as np
+from numpy import *
+import os, sys, time, argparse
+from numba import njit, prange
+from multiprocessing import Pool, Manager
+
+# Annealing rate for two reacting objects with masses mi, mj
+def k_rate(mi, mj):
+    return (mi + mj)**(9/14) * (mi * mj)**(15/14)
+
+# Single complete simulation, accepts the ntot parameter, executes all internal logic, and outputs data files.
+def run_simulation(ntot):
+
+
+    k_max0=(2)**(9/14) * (1)**(15/14)# Initial max value of K_ij# updated during the simulation
+    nevery_hist=10000 #Print histogram every this many time steps
+    time_max=1e5 #Stop the simulation when the waiting time is larger than this value
+    density=1.0 #Monomer number density
+    myseed=123 #Seed for random number generation
+
+    if(k_max0<0):
+        print("INPUT ERROR: Parameter k_max0 must be > 0.")
+        sys.exit()
+
+    #Intialize k_max 
+    k_max=k_max0
+
+    #Seed random generator
+    np.random.seed(myseed)
+
+    #os.system("mkdir xxx/histograms_ntot%d_Kd%.2e_density%.2e"%(ntot,K_max0,density))
+    def mkdir(path):
+        # os.path.exists Function to check whether a folder exists
+        folder = os.path.exists(path)
+
+    
+        if not folder:
+            os.makedirs(path)  
+            print('Folder created successfully:', path)
+
+        else:
+            print('Folder has existed：', path)
+
+
+    path= "xxx/optimized_simulation_ntot%d_density%.2e" % (ntot, density)
+    mkdir(path) 
+    #The nth element of the array is the mass of molecule n; initially, only monomers are present
+    masses=zeros(ntot,dtype="int32")+1 
+
+    with open(f"{path}/mav_vs_t_ntot{ntot}_density{density:.2e}_tmax{time_max:.2e}.txt","w") as fout:
+        waiting_time=0.
+        step=0
+        hist_count=0
+        n_mol=len(masses[masses!=0]) #Number of molecules
+        while(waiting_time<time_max):
+            if n_mol>1:
+                
+                '''
+                #Compute annealing probability
+                p_ann=1
+
+                if(random.rand()<p_ann):
+                '''
+                #Attempt annealing
+
+                        #Randomly select 2 molecules
+                        #masses[i] must be not 0 since 0 is for absence of molecule
+                        #also i must be different from j
+
+                i=np.random.choice(where(masses>0)[0])
+                j=int(np.random.rand()*ntot)
+
+                while(masses[j]==0 or j==i):
+                    j=int(np.random.rand()*ntot)
+                mi=masses[i]
+                mj=masses[j]
+                #Calculate coangulation rate
+                k_ij=k_rate(mi,mj)
+
+                if(k_ij>k_max): 
+                    #Update max. rate estimate
+                    k_max=k_ij
+
+                else:
+                    if(np.random.rand()<k_ij/k_max):
+                        #Annealing is performed
+
+                        #Increment time
+                        waiting_time+=2*ntot/(n_mol*(n_mol-1)*density*k_ij)
+
+                        #Update masses array
+                        masses[j]=mi+mj
+                        masses[i]=0
+
+                        #Update relevant quantities
+                        n_mol-=1
+                        #Compute mean and max mass
+                        mean_mass=mean(masses[masses!=0])
+                        reac_extent=1-float(n_mol)/ntot
+                        #Print relevant quantities
+                        fout.write("%.4e %.4e %.4e\n"%(waiting_time,mean_mass,reac_extent))
+                        step+=1
+            #Save and print histogram
+            else:
+                break
+            if(hist_count%nevery_hist==0):
+                masses_values=sort(array(list(set(masses[masses!=0]))))
+                masses_occurrences=array([list(masses).count(x) for x in masses_values])
+                hist=column_stack((masses_values,masses_occurrences))
+                savetxt(f"{path}/hist_n{step:010d}_waiting_t{waiting_time:.6e}.txt",hist,fmt='%d %d')			
+            hist_count+=1
+    return
+
+# -----------------------------------------------------------------------------
+# Wrapper function: In the subprocess, call run_simulation for each ntot, and record the time + write logs.
+# -----------------------------------------------------------------------------
+def worker(n_and_lock):
+    ntot, lock = n_and_lock
+    t0 = time.time()
+
+    # run simulation
+    run_simulation(ntot)
+
+    elapsed = time.time() - t0
+
+    # write log
+    with lock:
+        with open("/home/storage0/users/zhangborui/storage2/PBH_file/partial_con_Smoluchowski_equation_2025_6_13_CPU_time/output2.txt", "a") as log:
+            log.write(f"ntot={ntot}\ttime={elapsed:.6f} sec\n")
+        print(f"Complete ntot={ntot}, elapsed time {elapsed:.2f}s")
+
+    return ntot, elapsed
+
+# -----------------------------------------------------------------------------
+# Main Entry: Parse Parameters, Initialize, and Parallel Scheduling
+# -----------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Multi-parameter parallel PBH simulation")
+    parser.add_argument("--N_list", type=int, nargs="+", required=True,
+                    help="List of ntot values to scan, e.g., 1000 10000 20000")
+    parser.add_argument("--processes", type=int, default=None,
+                    help="Number of parallel processes (default: all cores)")
+    args = parser.parse_args()
+
+    # Initialize log
+    with open("xxx/output.txt", "w") as log:
+        log.write("# ntot\telapsed[s]\n")
+
+    # Multi-process lock
+    manager = Manager()
+    lock = manager.Lock()
+
+    # Assemble task list
+    tasks = [(n, lock) for n in args.N_list]
+
+    start_all = time.time()
+    with Pool(processes=args.processes) as pool:
+        pool.map(worker, tasks)
+
+    total = time.time() - start_all
+    print(f"\n All done！Total elapsed time {total:.2f} s")
+    with open("xx/output.txt", "a") as log:
+        log.write(f"\n# Total elapsed time: {total:.6f} s\n")
+
+if __name__ == "__main__":
+    main()
