@@ -1,2 +1,2 @@
 # Smoluchowski-Equation-and-the-Evolution-of-Primordial-Black-Hole-Clusters
-Using MC methods to solve the Smoluchowski equation which can be used in describing the merger of a PBH cluster.
+Python codes employing Monte Carlo methods to solve the Smoluchowski coagulation equation, which can be used to model the merger processes in primordial black hole (PBH) clusters, are provided. If you use this code, please cite \texttt{[xxx]}.
