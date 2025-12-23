@@ -4,7 +4,7 @@ import os, sys, time, argparse
 from numba import njit, prange
 from multiprocessing import Pool, Manager
 
-# Annealing rate for two reacting objects with masses mi, mj
+# coangulation rate for two reacting objects with masses mi, mj
 def k_rate(mi, mj):
     return (mi + mj)**(9/14) * (mi * mj)**(15/14)
 
