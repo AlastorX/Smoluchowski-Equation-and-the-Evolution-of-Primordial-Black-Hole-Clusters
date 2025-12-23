@@ -335,7 +335,9 @@ def run_with_timing(n):
     elapsed = time.time() - t0
     # Return a tuple: (parameter, calculation result, computation time)
     return n,elapsed
-
+# -----------------------------------------------------------------------------
+# Main Entry: Parse Parameters, Initialize, and Parallel Scheduling
+# -----------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="Multiprocessing parameter scan program")
     parser.add_argument("--N_list", type=int, nargs="+", required=True,
